@@ -9,8 +9,7 @@ import { FileParser } from './core/parser/FileParser';
 import { EmbeddingEngine } from './core/embeddings/EmbeddingEngine';
 import { MCPServer } from './core/mcp/MCPServer';
 import { CommitDiffEngine } from './core/diff/CommitDiffEngine';
-import { GraphExplorerPanel } from './ui/panels/GraphExplorerPanel';
-import { ContextInspectorPanel } from './ui/panels/ContextInspectorPanel';
+import { GraphUIServer } from './ui/GraphUIServer';
 import { IndexingStatusBar } from './utils/StatusBar';
 import { Logger } from './utils/Logger';
 
@@ -61,14 +60,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(watcher);
   }
 
-  // ── Webview panels ────────────────────────────────────────────────────────
-  const graphExplorerProvider = new GraphExplorerPanel(context, graphStore);
-  const contextInspectorProvider = new ContextInspectorPanel(context, graphStore);
-
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider('semanticKG.graphExplorer', graphExplorerProvider),
-    vscode.window.registerWebviewViewProvider('semanticKG.contextInspector', contextInspectorProvider)
-  );
+  // ── UI Server ────────────────────────────────────────────────────────────
+  const uiServer = new GraphUIServer(graphStore, 3580);
+  uiServer.start();
+  
+  // Clean up server on deactivation
+  context.subscriptions.push({ dispose: () => uiServer.stop() });
 
   // ── Commands ──────────────────────────────────────────────────────────────
   context.subscriptions.push(
@@ -78,12 +75,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     vscode.commands.registerCommand('semanticKG.openGraphExplorer', () => {
-      vscode.commands.executeCommand('semanticKG.graphExplorer.focus');
+      vscode.env.openExternal(vscode.Uri.parse('http://localhost:3580'));
     }),
 
-    vscode.commands.registerCommand('semanticKG.openContextInspector', () => {
-      vscode.commands.executeCommand('semanticKG.contextInspector.focus');
-    }),
+
 
     vscode.commands.registerCommand('semanticKG.suggestCommitMessage', async () => {
       statusBar?.setStatus('thinking');

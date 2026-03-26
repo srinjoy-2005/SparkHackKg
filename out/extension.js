@@ -45,8 +45,7 @@ const FileParser_1 = require("./core/parser/FileParser");
 const EmbeddingEngine_1 = require("./core/embeddings/EmbeddingEngine");
 const MCPServer_1 = require("./core/mcp/MCPServer");
 const CommitDiffEngine_1 = require("./core/diff/CommitDiffEngine");
-const GraphExplorerPanel_1 = require("./ui/panels/GraphExplorerPanel");
-const ContextInspectorPanel_1 = require("./ui/panels/ContextInspectorPanel");
+const GraphUIServer_1 = require("./ui/GraphUIServer");
 const StatusBar_1 = require("./utils/StatusBar");
 const Logger_1 = require("./utils/Logger");
 let graphStore = null;
@@ -87,18 +86,17 @@ async function activate(context) {
         watcher.onDidDelete(uri => graphStore.removeFile(uri.fsPath));
         context.subscriptions.push(watcher);
     }
-    // ── Webview panels ────────────────────────────────────────────────────────
-    const graphExplorerProvider = new GraphExplorerPanel_1.GraphExplorerPanel(context, graphStore);
-    const contextInspectorProvider = new ContextInspectorPanel_1.ContextInspectorPanel(context, graphStore);
-    context.subscriptions.push(vscode.window.registerWebviewViewProvider('semanticKG.graphExplorer', graphExplorerProvider), vscode.window.registerWebviewViewProvider('semanticKG.contextInspector', contextInspectorProvider));
+    // ── UI Server ────────────────────────────────────────────────────────────
+    const uiServer = new GraphUIServer_1.GraphUIServer(graphStore, 3580);
+    uiServer.start();
+    // Clean up server on deactivation
+    context.subscriptions.push({ dispose: () => uiServer.stop() });
     // ── Commands ──────────────────────────────────────────────────────────────
     context.subscriptions.push(vscode.commands.registerCommand('semanticKG.rebuildGraph', async () => {
         await runFullIndex(workspaceRoot, parser, embeddingEngine, graphStore, statusBar);
         vscode.window.showInformationMessage('Knowledge graph rebuilt!');
     }), vscode.commands.registerCommand('semanticKG.openGraphExplorer', () => {
-        vscode.commands.executeCommand('semanticKG.graphExplorer.focus');
-    }), vscode.commands.registerCommand('semanticKG.openContextInspector', () => {
-        vscode.commands.executeCommand('semanticKG.contextInspector.focus');
+        vscode.env.openExternal(vscode.Uri.parse('http://localhost:3580'));
     }), vscode.commands.registerCommand('semanticKG.suggestCommitMessage', async () => {
         statusBar?.setStatus('thinking');
         try {

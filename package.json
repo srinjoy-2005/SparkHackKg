@@ -22,11 +22,7 @@
       },
       {
         "command": "semanticKG.openGraphExplorer",
-        "title": "Semantic KG: Open Graph Explorer"
-      },
-      {
-        "command": "semanticKG.openContextInspector",
-        "title": "Semantic KG: Open Context Inspector"
+        "title": "Semantic KG: Open Graph Explorer (Browser)"
       },
       {
         "command": "semanticKG.suggestCommitMessage",
@@ -97,16 +93,11 @@
       ]
     },
     "views": {
-      "semanticKG": [
-        {
-          "type": "webview",
-          "id": "semanticKG.graphExplorer",
-          "name": "Graph Explorer"
-        },
+      "semanticKGExplorer": [
         {
           "type": "webview",
           "id": "semanticKG.contextInspector",
-          "name": "Context Inspector"
+          "name": "AI Context Inspector"
         }
       ]
     }
