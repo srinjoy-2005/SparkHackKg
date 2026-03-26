@@ -163,7 +163,7 @@ export class FileParser {
         const nameNode = node.childForFieldName?.('name') ?? node.children?.find((c: any) => c.type === 'identifier');
         
         if (!nameNode) { node.children?.forEach((c: any) => walk(c, parentId, parentClass)); return; }
-
+        
         const name = nameNode.text;
         const fullId = parentClass ? `${relPath}:${parentClass}.${name}` : `${relPath}:${name}`;
         const docstring = extractDocstring(node, lines);
