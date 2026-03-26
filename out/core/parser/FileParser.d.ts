@@ -3,7 +3,7 @@
  *
  * Supported languages: TypeScript, JavaScript, Python, Java, Go, Rust, C/C++
  */
-import { CodeNode } from '../graph/GraphStore';
+import { CodeNode, CodeEdge } from '../graph/GraphStore';
 export declare class FileParser {
     private readonly workspaceRoot;
     private readonly extensionRoot;
@@ -12,12 +12,15 @@ export declare class FileParser {
     private initialized;
     constructor(workspaceRoot: string, extensionRoot: string);
     private ensureInitialized;
-    parseWorkspace(): Promise<CodeNode[]>;
-    parseFile(filePath: string): Promise<CodeNode[]>;
+    parseWorkspace(): Promise<{
+        nodes: CodeNode[];
+        edges: CodeEdge[];
+    }>;
+    parseFile(filePath: string): Promise<{
+        nodes: CodeNode[];
+        edges: CodeEdge[];
+    }>;
     private loadLanguage;
     private extractSymbols;
-    /**
-     * Simple regex fallback for when Tree-sitter grammar files aren't bundled yet.
-     */
     private regexFallbackExtract;
 }

@@ -60,7 +60,7 @@ async function activate(context) {
         return;
     }
     // ── Core modules ──────────────────────────────────────────────────────────
-    const storagePath = context.globalStorageUri.fsPath;
+    const storagePath = context.storageUri ? context.storageUri.fsPath : context.globalStorageUri.fsPath;
     graphStore = new GraphStore_1.GraphStore(storagePath, workspaceRoot);
     await graphStore.initialize();
     const parser = new FileParser_1.FileParser(workspaceRoot, context.extensionUri.fsPath);
@@ -124,9 +124,10 @@ async function runFullIndex(workspaceRoot, parser, embeddingEngine, store, statu
     statusBar.setStatus('indexing');
     try {
         Logger_1.Logger.info('Starting full workspace index...');
-        const nodes = await parser.parseWorkspace();
+        const { nodes, edges } = await parser.parseWorkspace();
         await store.upsertNodes(nodes);
-        Logger_1.Logger.info(`Indexed ${nodes.length} symbols`);
+        store.upsertEdges(edges);
+        Logger_1.Logger.info(`Indexed ${nodes.length} symbols and ${edges.length} edges`);
         statusBar.setStatus('embedding');
         await embeddingEngine.generateMissingEmbeddings();
         Logger_1.Logger.info('Embeddings up to date');
@@ -142,8 +143,9 @@ async function runFullIndex(workspaceRoot, parser, embeddingEngine, store, statu
 async function onFileChanged(uri, parser, embeddingEngine, store, statusBar) {
     statusBar.setStatus('indexing');
     try {
-        const nodes = await parser.parseFile(uri.fsPath);
+        const { nodes, edges } = await parser.parseFile(uri.fsPath);
         await store.upsertNodes(nodes);
+        store.upsertEdges(edges);
         await embeddingEngine.generateMissingEmbeddings();
     }
     catch (err) {

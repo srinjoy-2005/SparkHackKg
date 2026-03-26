@@ -28,7 +28,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   // ── Core modules ──────────────────────────────────────────────────────────
-  const storagePath = context.globalStorageUri.fsPath;
+  const storagePath = context.storageUri ? context.storageUri.fsPath : context.globalStorageUri.fsPath;
   graphStore = new GraphStore(storagePath, workspaceRoot);
   await graphStore.initialize();
 
@@ -117,9 +117,10 @@ async function runFullIndex(
   statusBar.setStatus('indexing');
   try {
     Logger.info('Starting full workspace index...');
-    const nodes = await parser.parseWorkspace();
+    const { nodes, edges } = await parser.parseWorkspace();
     await store.upsertNodes(nodes);
-    Logger.info(`Indexed ${nodes.length} symbols`);
+    store.upsertEdges(edges);
+    Logger.info(`Indexed ${nodes.length} symbols and ${edges.length} edges`);
 
     statusBar.setStatus('embedding');
     await embeddingEngine.generateMissingEmbeddings();
@@ -141,8 +142,9 @@ async function onFileChanged(
 ): Promise<void> {
   statusBar.setStatus('indexing');
   try {
-    const nodes = await parser.parseFile(uri.fsPath);
+    const { nodes, edges } = await parser.parseFile(uri.fsPath);
     await store.upsertNodes(nodes);
+    store.upsertEdges(edges);
     await embeddingEngine.generateMissingEmbeddings();
   } catch (err) {
     Logger.warn(`Incremental update failed for ${uri.fsPath}: ${err}`);

@@ -66,7 +66,10 @@ class FileParser {
         if (this.initialized)
             return;
         const TreeSitter = await Promise.resolve().then(() => __importStar(require('web-tree-sitter')));
-        await TreeSitter.default.init();
+        const wasmPath = path.join(this.extensionRoot, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
+        await TreeSitter.default.init({
+            locateFile: () => wasmPath
+        });
         this.Parser = TreeSitter.default;
         this.initialized = true;
         Logger_1.Logger.info('Tree-sitter initialized');
@@ -86,34 +89,37 @@ class FileParser {
         });
         Logger_1.Logger.info(`Parsing ${files.length} files...`);
         const allNodes = [];
+        const allEdges = [];
         for (const filePath of files) {
             try {
-                const result = await this.parseFile(filePath);
-                allNodes.push(...result);
+                const { nodes, edges } = await this.parseFile(filePath);
+                allNodes.push(...nodes);
+                allEdges.push(...edges);
             }
             catch (err) {
                 Logger_1.Logger.warn(`Skip ${filePath}: ${err}`);
             }
         }
-        return allNodes;
+        return { nodes: allNodes, edges: allEdges };
     }
     async parseFile(filePath) {
         await this.ensureInitialized();
         const ext = path.extname(filePath).toLowerCase();
         const langEntry = Object.entries(LANGUAGE_MAP).find(([, v]) => v.exts.includes(ext));
         if (!langEntry)
-            return [];
+            return { nodes: [], edges: [] };
         const [langName] = langEntry;
         const code = fs.readFileSync(filePath, 'utf-8');
         const checksum = crypto.createHash('sha256').update(code).digest('hex').slice(0, 16);
         const relPath = path.relative(this.workspaceRoot, filePath);
         const nodes = [];
-        // File node
+        const edges = [];
+        // File node (The root parent for CONTAINS edges)
         const fileNodeId = relPath;
         nodes.push({
             id: fileNodeId,
             type: 'file',
-            name: path.basename(filePath),
+            name: relPath,
             filePath,
             signature: '',
             docstring: '',
@@ -123,20 +129,19 @@ class FileParser {
             startLine: 0,
             endLine: code.split('\n').length,
         });
-        // Try Tree-sitter parse; fall back to regex if grammar not loaded
         try {
             const language = await this.loadLanguage(langName, langEntry[1].grammar);
             const parser = new this.Parser();
             parser.setLanguage(language);
             const tree = parser.parse(code);
-            this.extractSymbols(tree.rootNode, code, filePath, relPath, nodes);
+            this.extractSymbols(tree.rootNode, code, filePath, relPath, nodes, edges);
             tree.delete();
         }
         catch (err) {
             Logger_1.Logger.warn(`Tree-sitter parse failed for ${filePath}, using regex fallback: ${err}`);
-            this.regexFallbackExtract(code, filePath, relPath, nodes);
+            this.regexFallbackExtract(code, filePath, relPath, nodes, edges);
         }
-        return nodes;
+        return { nodes, edges };
     }
     async loadLanguage(langName, grammarFile) {
         if (this.languages.has(langName))
@@ -149,15 +154,16 @@ class FileParser {
         this.languages.set(langName, lang);
         return lang;
     }
-    extractSymbols(rootNode, code, filePath, relPath, nodes) {
+    extractSymbols(rootNode, code, filePath, relPath, nodes, edges) {
         const lines = code.split('\n');
-        const walk = (node, parentClass) => {
+        const fileNodeId = relPath;
+        const walk = (node, parentId, parentClass) => {
             const type = node.type;
             if (type === 'function_declaration' || type === 'function_definition' ||
                 type === 'method_definition' || type === 'function_item') {
                 const nameNode = node.childForFieldName?.('name') ?? node.children?.find((c) => c.type === 'identifier');
                 if (!nameNode) {
-                    node.children?.forEach((c) => walk(c, parentClass));
+                    node.children?.forEach((c) => walk(c, parentId, parentClass));
                     return;
                 }
                 const name = nameNode.text;
@@ -177,12 +183,13 @@ class FileParser {
                     startLine: node.startPosition.row,
                     endLine: node.endPosition.row,
                 });
-                node.children?.forEach((c) => walk(c, parentClass));
+                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
+                node.children?.forEach((c) => walk(c, fullId, parentClass));
             }
             else if (type === 'class_declaration' || type === 'class_definition') {
                 const nameNode = node.childForFieldName?.('name') ?? node.children?.find((c) => c.type === 'identifier' || c.type === 'type_identifier');
                 if (!nameNode) {
-                    node.children?.forEach((c) => walk(c));
+                    node.children?.forEach((c) => walk(c, parentId));
                     return;
                 }
                 const name = nameNode.text;
@@ -201,17 +208,47 @@ class FileParser {
                     startLine: node.startPosition.row,
                     endLine: node.endPosition.row,
                 });
-                node.children?.forEach((c) => walk(c, name));
+                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
+                // === EXTENDS & IMPLEMENTS LOGIC FOR CLASSES ===
+                // Look for AST nodes that signify inheritance or interfaces
+                const heritageNodes = node.children?.filter((c) => ['class_heritage', 'superclass', 'base_classes', 'interfaces'].includes(c.type)) || [];
+                heritageNodes.forEach((heritage) => {
+                    // Recursive scanner to find all type identifiers inside the heritage clause
+                    const findTypes = (n, currentRelation) => {
+                        // Switch relation context if we enter an implements/extends block
+                        if (n.type === 'extends_clause' || n.type === 'superclass' || n.type === 'base_classes') {
+                            currentRelation = 'EXTENDS';
+                        }
+                        else if (n.type === 'implements_clause' || n.type === 'interfaces') {
+                            currentRelation = 'IMPLEMENTS';
+                        }
+                        if (n.type === 'type_identifier' || n.type === 'identifier') {
+                            edges.push({
+                                sourceId: fullId,
+                                targetId: `${relPath}:${n.text}`, // Naive local resolution
+                                relationType: currentRelation
+                            });
+                        }
+                        else {
+                            n.children?.forEach((child) => findTypes(child, currentRelation));
+                        }
+                    };
+                    const defaultRelation = heritage.type === 'interfaces' ? 'IMPLEMENTS' : 'EXTENDS';
+                    findTypes(heritage, defaultRelation);
+                });
+                // ==============================================
+                node.children?.forEach((c) => walk(c, fullId, name));
             }
             else if (type === 'interface_declaration') {
                 const nameNode = node.children?.find((c) => c.type === 'type_identifier');
                 if (!nameNode) {
-                    node.children?.forEach((c) => walk(c));
+                    node.children?.forEach((c) => walk(c, parentId));
                     return;
                 }
                 const name = nameNode.text;
+                const fullId = `${relPath}:${name}`;
                 nodes.push({
-                    id: `${relPath}:${name}`,
+                    id: fullId,
                     type: 'interface',
                     name,
                     filePath,
@@ -223,22 +260,33 @@ class FileParser {
                     startLine: node.startPosition.row,
                     endLine: node.endPosition.row,
                 });
-                node.children?.forEach((c) => walk(c));
+                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
+                // === EXTENDS LOGIC FOR INTERFACES ===
+                // Interfaces can extend other interfaces!
+                const heritageNodes = node.children?.filter((c) => ['extends_clause'].includes(c.type)) || [];
+                heritageNodes.forEach((heritage) => {
+                    const findTypes = (n) => {
+                        if (n.type === 'type_identifier' || n.type === 'identifier') {
+                            edges.push({ sourceId: fullId, targetId: `${relPath}:${n.text}`, relationType: 'EXTENDS' });
+                        }
+                        else {
+                            n.children?.forEach((child) => findTypes(child));
+                        }
+                    };
+                    findTypes(heritage);
+                });
+                // ====================================
+                node.children?.forEach((c) => walk(c, fullId, name));
             }
             else {
-                node.children?.forEach((c) => walk(c, parentClass));
+                node.children?.forEach((c) => walk(c, parentId, parentClass));
             }
         };
-        walk(rootNode);
+        walk(rootNode, fileNodeId);
     }
-    /**
-     * Simple regex fallback for when Tree-sitter grammar files aren't bundled yet.
-     */
-    regexFallbackExtract(code, filePath, relPath, nodes) {
+    regexFallbackExtract(code, filePath, relPath, nodes, edges) {
         const lines = code.split('\n');
-        // Python / JS / TS function pattern
         const fnRegex = /^(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(|def\s+(\w+))/gm;
-        // Class pattern
         const classRegex = /^(?:export\s+)?class\s+(\w+)/gm;
         let match;
         while ((match = fnRegex.exec(code)) !== null) {
@@ -246,6 +294,7 @@ class FileParser {
             if (!name)
                 continue;
             const lineNo = code.slice(0, match.index).split('\n').length - 1;
+            const fullId = `${relPath}:${name}`;
             nodes.push({
                 id: `${relPath}:${name}`,
                 type: 'function',
@@ -259,10 +308,12 @@ class FileParser {
                 startLine: lineNo,
                 endLine: lineNo,
             });
+            edges.push({ sourceId: relPath, targetId: fullId, relationType: 'CONTAINS' });
         }
         while ((match = classRegex.exec(code)) !== null) {
             const name = match[1];
             const lineNo = code.slice(0, match.index).split('\n').length - 1;
+            const fullId = `${relPath}:${name}`;
             nodes.push({
                 id: `${relPath}:${name}`,
                 type: 'class',
@@ -276,22 +327,20 @@ class FileParser {
                 startLine: lineNo,
                 endLine: lineNo,
             });
+            edges.push({ sourceId: relPath, targetId: fullId, relationType: 'CONTAINS' });
         }
     }
 }
 exports.FileParser = FileParser;
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function extractDocstring(node, lines) {
-    // Look for comment/string node directly before or at start of body
     const startLine = node.startPosition?.row ?? 0;
     if (startLine === 0)
         return '';
     const prevLine = lines[startLine - 1]?.trim() ?? '';
-    // Single-line comment
     if (prevLine.startsWith('//') || prevLine.startsWith('#')) {
         return prevLine.replace(/^[/#\s*]+/, '').trim();
     }
-    // JS/TS JSDoc block comment
     if (prevLine.startsWith('*/')) {
         const commentLines = [];
         for (let i = startLine - 2; i >= 0; i--) {
@@ -302,7 +351,6 @@ function extractDocstring(node, lines) {
         }
         return commentLines.join(' ').trim();
     }
-    // Python docstring (first string inside body)
     const bodyNode = node.childForFieldName?.('body');
     if (bodyNode) {
         const first = bodyNode.children?.[0];
@@ -316,7 +364,6 @@ function extractDocstring(node, lines) {
     return '';
 }
 function extractSignature(node, code) {
-    // Grab everything up to (but not including) the function body
     const bodyNode = node.childForFieldName?.('body');
     if (bodyNode) {
         return code.slice(node.startIndex, bodyNode.startIndex).replace(/\s+/g, ' ').trim();
