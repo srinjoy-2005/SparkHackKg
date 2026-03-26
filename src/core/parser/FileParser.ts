@@ -59,6 +59,7 @@ export class FileParser {
     const allExtensions = Object.values(LANGUAGE_MAP).flatMap(l => l.exts);
     const pattern = `**/*{${allExtensions.join(',')}}`;
 
+    
     const files = await glob(pattern, {
       cwd: this.workspaceRoot,
       ignore: excludePatterns,
