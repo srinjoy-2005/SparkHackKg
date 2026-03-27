@@ -1,8 +1,20 @@
 "use strict";
 /**
- * FileParser — uses web-tree-sitter (WASM) to extract symbols from source files.
+ * FileParser — Phase 1: Symbol extraction via Tree-sitter (WASM)
  *
- * Supported languages: TypeScript, JavaScript, Python, Java, Go, Rust, C/C++
+ * Root cause of missing Java function nodes (FIXED):
+ *   - Java uses 'method_declaration', not 'method_definition'
+ *   - Java constructors are 'constructor_declaration'
+ *   - walk() was not recursing into class_body/block nodes when they
+ *     fell into the generic else-branch, so methods inside classes were lost.
+ *   - FIX: every AST node type now always recurses; symbol types are
+ *     detected by a Set lookup, not fragile if/else chains.
+ *
+ * Produces:
+ *   - CodeNode[] with FULL metadata (modifiers, className, packageName, etc.)
+ *   - CodeEdge[] for CONTAINS, EXTENDS, IMPLEMENTS
+ *
+ * CALL edges are NOT produced here — see CallResolver.ts (second pass).
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -44,7 +56,6 @@ const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
 const glob_1 = require("glob");
 const Logger_1 = require("../../utils/Logger");
-// Language → WASM grammar file mapping
 const LANGUAGE_MAP = {
     typescript: { exts: ['.ts', '.tsx'], grammar: 'tree-sitter-typescript.wasm' },
     javascript: { exts: ['.js', '.jsx', '.mjs'], grammar: 'tree-sitter-javascript.wasm' },
@@ -54,9 +65,53 @@ const LANGUAGE_MAP = {
     rust: { exts: ['.rs'], grammar: 'tree-sitter-rust.wasm' },
     cpp: { exts: ['.cpp', '.cc', '.cxx', '.h', '.hpp', '.c'], grammar: 'tree-sitter-cpp.wasm' },
 };
+// ── DEBUG HANG DETECTOR ──────────────────────────────────────────────────────
+function withTimeout(promise, ms, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`[HANG DETECTED] ${label} froze for ${ms}ms!`)), ms))
+    ]);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Per-language AST node type sets ──────────────────────────────────────────
+const CLASS_NODE_TYPES = new Set([
+    'class_declaration', // JS/TS/Java/C#
+    'class_definition', // Python
+    'struct_item', // Rust
+    'impl_item', // Rust impl block
+    'enum_declaration', // Java
+    'record_declaration', // Java 16+
+    'type_declaration', // Go (struct/interface)
+]);
+const INTERFACE_NODE_TYPES = new Set([
+    'interface_declaration', // JS/TS/Java
+    'trait_item', // Rust
+]);
+// Functions that live at file level
+const FUNCTION_NODE_TYPES = new Set([
+    'function_declaration', // JS/TS/Go
+    'function_definition', // Python/C/C++
+    'function_item', // Rust
+    'function_expression', // JS (var fn = function() {})
+    'arrow_function', // JS/TS (const fn = () => {})
+    'function_signature', // TS declaration files
+]);
+// Functions that live inside a class body
+const METHOD_NODE_TYPES = new Set([
+    'method_definition', // JS/TS class method
+    'method_declaration', // Java
+    'constructor_declaration', // Java constructor
+    'method_signature', // TS interface method
+]);
+const MODIFIER_KEYWORDS = new Set([
+    'public', 'private', 'protected', 'static', 'abstract', 'final',
+    'async', 'override', 'readonly', 'export', 'default', 'native',
+    'synchronized', 'volatile', 'transient',
+]);
 class FileParser {
     constructor(workspaceRoot, extensionRoot) {
-        this.Parser = null;
+        this.ParserClass = null; // The Parser constructor
+        this.Language = null; // The Language static class (stored separately)
         this.languages = new Map();
         this.initialized = false;
         this.workspaceRoot = workspaceRoot;
@@ -65,24 +120,43 @@ class FileParser {
     async ensureInitialized() {
         if (this.initialized)
             return;
-        const TreeSitter = await Promise.resolve().then(() => __importStar(require('web-tree-sitter')));
+        Logger_1.Logger.info(`[DEBUG] ensureInitialized() started`);
         const wasmPath = path.join(this.extensionRoot, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
-        await TreeSitter.default.init({
-            locateFile: () => wasmPath
-        });
-        this.Parser = TreeSitter.default;
+        Logger_1.Logger.info(`[DEBUG] Checking for main tree-sitter.wasm at: ${wasmPath}`);
+        if (!fs.existsSync(wasmPath)) {
+            throw new Error(`[DEBUG] Main WASM engine missing at ${wasmPath}`);
+        }
+        Logger_1.Logger.info(`[DEBUG] Requiring web-tree-sitter module...`);
+        const TreeSitter = require('web-tree-sitter');
+        try {
+            Logger_1.Logger.info(`[DEBUG] Awaiting TreeSitter.init()...`);
+            // Wrap init in a 5-second timeout to catch hangs
+            await withTimeout(TreeSitter.init({ locateFile: () => wasmPath }), 5000, "TreeSitter.init()");
+            Logger_1.Logger.info(`[DEBUG] TreeSitter.init() completed successfully.`);
+            if (!TreeSitter.Language) {
+                Logger_1.Logger.warn("[DEBUG] Tree-sitter init finished but Language class is missing on the object!");
+            }
+        }
+        catch (e) {
+            Logger_1.Logger.error(`[DEBUG] Tree-sitter init FATAL ERROR: ${e}`);
+            throw e;
+        }
+        this.ParserClass = TreeSitter;
+        this.Language = TreeSitter.Language;
         this.initialized = true;
-        Logger_1.Logger.info('Tree-sitter initialized');
+        Logger_1.Logger.info(`[DEBUG] ensureInitialized() completed`);
     }
+    // ── Workspace parse ────────────────────────────────────────────────────────
     async parseWorkspace() {
         await this.ensureInitialized();
-        const config = await Promise.resolve().then(() => __importStar(require('vscode'))).then(v => v.workspace.getConfiguration('semanticKG'));
+        const vscode = await Promise.resolve().then(() => __importStar(require('vscode')));
+        const config = vscode.workspace.getConfiguration('semanticKG');
         const excludePatterns = config.get('excludePatterns', [
             '**/node_modules/**', '**/.git/**', '**/dist/**', '**/out/**',
+            '**/__pycache__/**', '**/target/**', '**/build/**', '**/bin/**',
         ]);
-        const allExtensions = Object.values(LANGUAGE_MAP).flatMap(l => l.exts);
-        const pattern = `**/*{${allExtensions.join(',')}}`;
-        const files = await (0, glob_1.glob)(pattern, {
+        const allExts = Object.values(LANGUAGE_MAP).flatMap(l => l.exts);
+        const files = await (0, glob_1.glob)(`**/*{${allExts.join(',')}}`, {
             cwd: this.workspaceRoot,
             ignore: excludePatterns,
             absolute: true,
@@ -90,249 +164,343 @@ class FileParser {
         Logger_1.Logger.info(`Parsing ${files.length} files...`);
         const allNodes = [];
         const allEdges = [];
+        let parsed = 0, skipped = 0;
         for (const filePath of files) {
             try {
                 const { nodes, edges } = await this.parseFile(filePath);
                 allNodes.push(...nodes);
                 allEdges.push(...edges);
+                parsed++;
             }
             catch (err) {
-                Logger_1.Logger.warn(`Skip ${filePath}: ${err}`);
+                Logger_1.Logger.warn(`Skip ${path.relative(this.workspaceRoot, filePath)}: ${err}`);
+                skipped++;
             }
         }
+        Logger_1.Logger.info(`Parse done: ${parsed} files, ${skipped} skipped, ` +
+            `${allNodes.length} nodes, ${allEdges.length} structural edges`);
         return { nodes: allNodes, edges: allEdges };
     }
+    // ── Single file parse ──────────────────────────────────────────────────────
     async parseFile(filePath) {
         await this.ensureInitialized();
         const ext = path.extname(filePath).toLowerCase();
         const langEntry = Object.entries(LANGUAGE_MAP).find(([, v]) => v.exts.includes(ext));
         if (!langEntry)
             return { nodes: [], edges: [] };
-        const [langName] = langEntry;
-        const code = fs.readFileSync(filePath, 'utf-8');
-        const checksum = crypto.createHash('sha256').update(code).digest('hex').slice(0, 16);
-        const relPath = path.relative(this.workspaceRoot, filePath);
+        const [langName, langConfig] = langEntry;
+        let code;
+        try {
+            code = fs.readFileSync(filePath, 'utf-8');
+        }
+        catch {
+            return { nodes: [], edges: [] };
+        }
+        const relPath = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
+        const checksum = hashText(code);
+        const lines = code.split('\n');
+        const pkgName = extractPackageName(code, langName);
         const nodes = [];
         const edges = [];
-        // File node (The root parent for CONTAINS edges)
-        const fileNodeId = relPath;
+        // File node (root of CONTAINS hierarchy)
         nodes.push({
-            id: fileNodeId,
-            type: 'file',
-            name: relPath,
-            filePath,
-            signature: '',
-            docstring: '',
-            communityId: 0,
-            checksum,
-            isAutoGenerated: false,
-            startLine: 0,
-            endLine: code.split('\n').length,
+            id: relPath, type: 'file', name: path.basename(filePath),
+            filePath, signature: '', docstring: '', communityId: 0,
+            checksum, isAutoGenerated: false, startLine: 0, endLine: lines.length,
+            modifiers: [], className: null, packageName: pkgName,
         });
         try {
-            const language = await this.loadLanguage(langName, langEntry[1].grammar);
-            const parser = new this.Parser();
+            // DEBUG: Log which grammar we are trying to load
+            Logger_1.Logger.info(`Loading grammar for ${langName} from ${langConfig.grammar}`);
+            const language = await this.loadLanguage(langName, langConfig.grammar);
+            // DEBUG: Check if language object is valid before passing to parser
+            if (!language) {
+                throw new Error(`loadLanguage returned null for ${langName}`);
+            }
+            const parser = new this.ParserClass();
+            // DEBUG: This is often where the 'loadWebAssemblyModule' error triggers
+            Logger_1.Logger.info(`Setting language for parser...`);
             parser.setLanguage(language);
             const tree = parser.parse(code);
-            this.extractSymbols(tree.rootNode, code, filePath, relPath, nodes, edges);
+            this.walkTree(tree.rootNode, code, lines, filePath, relPath, pkgName, nodes, edges);
             tree.delete();
         }
         catch (err) {
-            Logger_1.Logger.warn(`Tree-sitter parse failed for ${filePath}, using regex fallback: ${err}`);
-            this.regexFallbackExtract(code, filePath, relPath, nodes, edges);
+            // This will now catch the loadWebAssemblyModule error and give us context
+            Logger_1.Logger.error(`Tree-sitter parse execution failed for ${relPath}: ${err}`);
+            Logger_1.Logger.warn(`Falling back to regex for ${relPath}`);
+            this.regexFallback(code, filePath, relPath, pkgName, nodes, edges);
         }
         return { nodes, edges };
     }
     async loadLanguage(langName, grammarFile) {
         if (this.languages.has(langName))
             return this.languages.get(langName);
+        Logger_1.Logger.info(`[DEBUG] loadLanguage() called for: ${langName}`);
+        if (!this.Language) {
+            throw new Error("[DEBUG] Attempted to load language before Tree-sitter engine was initialized.");
+        }
         const grammarPath = path.join(this.extensionRoot, 'grammars', grammarFile);
+        Logger_1.Logger.info(`[DEBUG] Checking grammar file at: ${grammarPath}`);
         if (!fs.existsSync(grammarPath)) {
-            throw new Error(`Grammar not found: ${grammarPath}`);
+            throw new Error(`[DEBUG] Grammar not found: ${grammarPath}`);
         }
-        const lang = await this.Parser.Language.load(grammarPath);
-        this.languages.set(langName, lang);
-        return lang;
+        Logger_1.Logger.info(`[DEBUG] Reading raw bytes from ${grammarFile}...`);
+        const bytes = fs.readFileSync(grammarPath);
+        Logger_1.Logger.info(`[DEBUG] Read ${bytes.length} bytes for ${langName}. Converting to Uint8Array...`);
+        const uint8Array = new Uint8Array(bytes);
+        try {
+            Logger_1.Logger.info(`[DEBUG] Awaiting this.Language.load() for ${langName}...`);
+            // Wrap grammar loading in a 3-second timeout! 
+            // THIS IS WHERE IT IS LIKELY HANGING.
+            const loaded = await withTimeout(this.Language.load(uint8Array), 3000, `Language.load(${langName})`);
+            Logger_1.Logger.info(`[DEBUG] this.Language.load() completed for ${langName}`);
+            let lang = loaded;
+            if (langName === 'typescript' && loaded && loaded.typescript) {
+                lang = loaded.typescript;
+            }
+            this.languages.set(langName, lang);
+            return lang;
+        }
+        catch (err) {
+            Logger_1.Logger.error(`[DEBUG] WASM Load failed for ${langName}: ${err}`);
+            throw err;
+        }
     }
-    extractSymbols(rootNode, code, filePath, relPath, nodes, edges) {
-        const lines = code.split('\n');
-        const fileNodeId = relPath;
+    // ── AST walker ─────────────────────────────────────────────────────────────
+    walkTree(rootNode, code, lines, filePath, relPath, pkgName, nodes, edges) {
+        /**
+         * Recursive walk.
+         * parentId    — graph ID of the innermost enclosing symbol node
+         * parentClass — name of the innermost enclosing class (null at file level)
+         *
+         * KEY DESIGN: we ALWAYS recurse into every node. The only thing that
+         * changes per symbol type is what we push to nodes/edges BEFORE recursing.
+         */
         const walk = (node, parentId, parentClass) => {
-            const type = node.type;
-            if (type === 'function_declaration' || type === 'function_definition' ||
-                type === 'method_definition' || type === 'function_item') {
-                const nameNode = node.childForFieldName?.('name') ?? node.children?.find((c) => c.type === 'identifier');
-                if (!nameNode) {
-                    node.children?.forEach((c) => walk(c, parentId, parentClass));
+            if (!node)
+                return;
+            const t = node.type ?? '';
+            // ── CLASS ──────────────────────────────────────────────────────────
+            if (CLASS_NODE_TYPES.has(t)) {
+                const name = resolveClassName(node, t);
+                if (name) {
+                    const id = `${relPath}:${name}`;
+                    const doc = extractDocstring(node, lines);
+                    nodes.push({
+                        id, type: 'class', name, filePath,
+                        signature: buildClassSignature(node, name),
+                        docstring: doc, communityId: 0,
+                        checksum: hashText(node.text?.slice(0, 300) ?? ''),
+                        isAutoGenerated: false,
+                        startLine: node.startPosition.row, endLine: node.endPosition.row,
+                        modifiers: extractModifiers(node), className: null, packageName: pkgName,
+                    });
+                    edges.push({ sourceId: parentId, targetId: id, relationType: 'CONTAINS' });
+                    extractHeritage(node, id, relPath, edges);
+                    // Recurse with this class as the new parent
+                    for (const child of (node.children ?? []))
+                        walk(child, id, name);
+                    return; // ← don't fall through to the default recurse below
+                }
+            }
+            // ── INTERFACE / TRAIT ──────────────────────────────────────────────
+            if (INTERFACE_NODE_TYPES.has(t)) {
+                const name = getFieldText(node, ['name', 'type_identifier', 'identifier']);
+                if (name) {
+                    const id = `${relPath}:${name}`;
+                    nodes.push({
+                        id, type: 'interface', name, filePath,
+                        signature: `interface ${name}`,
+                        docstring: extractDocstring(node, lines), communityId: 0,
+                        checksum: '', isAutoGenerated: false,
+                        startLine: node.startPosition.row, endLine: node.endPosition.row,
+                        modifiers: extractModifiers(node), className: null, packageName: pkgName,
+                    });
+                    edges.push({ sourceId: parentId, targetId: id, relationType: 'CONTAINS' });
+                    // Interface extends other interfaces
+                    for (const child of (node.children ?? [])) {
+                        if (child.type === 'extends_clause') {
+                            collectTypeNames(child).forEach(iname => edges.push({ sourceId: id, targetId: `${relPath}:${iname}`, relationType: 'EXTENDS' }));
+                        }
+                    }
+                    for (const child of (node.children ?? []))
+                        walk(child, id, name);
                     return;
                 }
-                const name = nameNode.text;
-                const fullId = parentClass ? `${relPath}:${parentClass}.${name}` : `${relPath}:${name}`;
-                const docstring = extractDocstring(node, lines);
-                const signature = extractSignature(node, code);
-                nodes.push({
-                    id: fullId,
-                    type: parentClass ? 'method' : 'function',
-                    name,
-                    filePath,
-                    signature,
-                    docstring,
-                    communityId: 0,
-                    checksum: crypto.createHash('sha256').update(node.text).digest('hex').slice(0, 16),
-                    isAutoGenerated: false,
-                    startLine: node.startPosition.row,
-                    endLine: node.endPosition.row,
-                });
-                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
-                node.children?.forEach((c) => walk(c, fullId, parentClass));
             }
-            else if (type === 'class_declaration' || type === 'class_definition') {
-                const nameNode = node.childForFieldName?.('name') ?? node.children?.find((c) => c.type === 'identifier' || c.type === 'type_identifier');
-                if (!nameNode) {
-                    node.children?.forEach((c) => walk(c, parentId));
+            // ── METHOD (inside a class) ────────────────────────────────────────
+            if (METHOD_NODE_TYPES.has(t)) {
+                const name = resolveMethodName(node, t);
+                if (name) {
+                    const isInsideClass = parentClass !== null;
+                    const id = isInsideClass
+                        ? `${relPath}:${parentClass}.${name}`
+                        : `${relPath}:${name}`;
+                    nodes.push({
+                        id, type: isInsideClass ? 'method' : 'function', name, filePath,
+                        signature: extractSignature(node, code),
+                        docstring: extractDocstring(node, lines), communityId: 0,
+                        checksum: hashText(node.text?.slice(0, 500) ?? ''),
+                        isAutoGenerated: false,
+                        startLine: node.startPosition.row, endLine: node.endPosition.row,
+                        modifiers: extractModifiers(node),
+                        className: parentClass,
+                        packageName: pkgName,
+                    });
+                    edges.push({ sourceId: parentId, targetId: id, relationType: 'CONTAINS' });
+                    // Recurse into body for nested functions
+                    for (const child of (node.children ?? []))
+                        walk(child, id, parentClass);
                     return;
                 }
-                const name = nameNode.text;
-                const fullId = `${relPath}:${name}`;
-                const docstring = extractDocstring(node, lines);
-                nodes.push({
-                    id: fullId,
-                    type: 'class',
-                    name,
-                    filePath,
-                    signature: `class ${name}`,
-                    docstring,
-                    communityId: 0,
-                    checksum: crypto.createHash('sha256').update(node.text.slice(0, 200)).digest('hex').slice(0, 16),
-                    isAutoGenerated: false,
-                    startLine: node.startPosition.row,
-                    endLine: node.endPosition.row,
-                });
-                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
-                // === EXTENDS & IMPLEMENTS LOGIC FOR CLASSES ===
-                // Look for AST nodes that signify inheritance or interfaces
-                const heritageNodes = node.children?.filter((c) => ['class_heritage', 'superclass', 'base_classes', 'interfaces'].includes(c.type)) || [];
-                heritageNodes.forEach((heritage) => {
-                    // Recursive scanner to find all type identifiers inside the heritage clause
-                    const findTypes = (n, currentRelation) => {
-                        // Switch relation context if we enter an implements/extends block
-                        if (n.type === 'extends_clause' || n.type === 'superclass' || n.type === 'base_classes') {
-                            currentRelation = 'EXTENDS';
-                        }
-                        else if (n.type === 'implements_clause' || n.type === 'interfaces') {
-                            currentRelation = 'IMPLEMENTS';
-                        }
-                        if (n.type === 'type_identifier' || n.type === 'identifier') {
-                            edges.push({
-                                sourceId: fullId,
-                                targetId: `${relPath}:${n.text}`, // Naive local resolution
-                                relationType: currentRelation
-                            });
-                        }
-                        else {
-                            n.children?.forEach((child) => findTypes(child, currentRelation));
-                        }
-                    };
-                    const defaultRelation = heritage.type === 'interfaces' ? 'IMPLEMENTS' : 'EXTENDS';
-                    findTypes(heritage, defaultRelation);
-                });
-                // ==============================================
-                node.children?.forEach((c) => walk(c, fullId, name));
             }
-            else if (type === 'interface_declaration') {
-                const nameNode = node.children?.find((c) => c.type === 'type_identifier');
-                if (!nameNode) {
-                    node.children?.forEach((c) => walk(c, parentId));
+            // ── FUNCTION (file level or nested) ───────────────────────────────
+            if (FUNCTION_NODE_TYPES.has(t)) {
+                const name = resolveFunctionName(node, t);
+                if (name) {
+                    const isInsideClass = parentClass !== null;
+                    const id = isInsideClass
+                        ? `${relPath}:${parentClass}.${name}`
+                        : `${relPath}:${name}`;
+                    nodes.push({
+                        id, type: isInsideClass ? 'method' : 'function', name, filePath,
+                        signature: extractSignature(node, code),
+                        docstring: extractDocstring(node, lines), communityId: 0,
+                        checksum: hashText(node.text?.slice(0, 500) ?? ''),
+                        isAutoGenerated: false,
+                        startLine: node.startPosition.row, endLine: node.endPosition.row,
+                        modifiers: extractModifiers(node),
+                        className: parentClass,
+                        packageName: pkgName,
+                    });
+                    edges.push({ sourceId: parentId, targetId: id, relationType: 'CONTAINS' });
+                    for (const child of (node.children ?? []))
+                        walk(child, id, parentClass);
                     return;
                 }
-                const name = nameNode.text;
-                const fullId = `${relPath}:${name}`;
-                nodes.push({
-                    id: fullId,
-                    type: 'interface',
-                    name,
-                    filePath,
-                    signature: `interface ${name}`,
-                    docstring: extractDocstring(node, lines),
-                    communityId: 0,
-                    checksum: '',
-                    isAutoGenerated: false,
-                    startLine: node.startPosition.row,
-                    endLine: node.endPosition.row,
-                });
-                edges.push({ sourceId: parentId, targetId: fullId, relationType: 'CONTAINS' });
-                // === EXTENDS LOGIC FOR INTERFACES ===
-                // Interfaces can extend other interfaces!
-                const heritageNodes = node.children?.filter((c) => ['extends_clause'].includes(c.type)) || [];
-                heritageNodes.forEach((heritage) => {
-                    const findTypes = (n) => {
-                        if (n.type === 'type_identifier' || n.type === 'identifier') {
-                            edges.push({ sourceId: fullId, targetId: `${relPath}:${n.text}`, relationType: 'EXTENDS' });
-                        }
-                        else {
-                            n.children?.forEach((child) => findTypes(child));
-                        }
-                    };
-                    findTypes(heritage);
-                });
-                // ====================================
-                node.children?.forEach((c) => walk(c, fullId, name));
             }
-            else {
-                node.children?.forEach((c) => walk(c, parentId, parentClass));
-            }
+            // ── DEFAULT: always recurse, preserving context ────────────────────
+            for (const child of (node.children ?? []))
+                walk(child, parentId, parentClass);
         };
-        walk(rootNode, fileNodeId);
+        walk(rootNode, relPath, null);
     }
-    regexFallbackExtract(code, filePath, relPath, nodes, edges) {
-        const lines = code.split('\n');
-        const fnRegex = /^(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(|def\s+(\w+))/gm;
-        const classRegex = /^(?:export\s+)?class\s+(\w+)/gm;
-        let match;
-        while ((match = fnRegex.exec(code)) !== null) {
-            const name = match[1] ?? match[2] ?? match[3];
-            if (!name)
-                continue;
-            const lineNo = code.slice(0, match.index).split('\n').length - 1;
-            const fullId = `${relPath}:${name}`;
-            nodes.push({
-                id: `${relPath}:${name}`,
-                type: 'function',
-                name,
-                filePath,
-                signature: match[0].trim(),
-                docstring: '',
-                communityId: 0,
-                checksum: '',
-                isAutoGenerated: false,
-                startLine: lineNo,
-                endLine: lineNo,
-            });
-            edges.push({ sourceId: relPath, targetId: fullId, relationType: 'CONTAINS' });
-        }
-        while ((match = classRegex.exec(code)) !== null) {
-            const name = match[1];
-            const lineNo = code.slice(0, match.index).split('\n').length - 1;
-            const fullId = `${relPath}:${name}`;
-            nodes.push({
-                id: `${relPath}:${name}`,
-                type: 'class',
-                name,
-                filePath,
-                signature: `class ${name}`,
-                docstring: '',
-                communityId: 0,
-                checksum: '',
-                isAutoGenerated: false,
-                startLine: lineNo,
-                endLine: lineNo,
-            });
-            edges.push({ sourceId: relPath, targetId: fullId, relationType: 'CONTAINS' });
+    // ── Regex fallback ─────────────────────────────────────────────────────────
+    regexFallback(code, filePath, relPath, pkgName, nodes, edges) {
+        const push = (name, type, lineNo, sig) => {
+            const id = `${relPath}:${name}`;
+            if (nodes.some(n => n.id === id))
+                return;
+            nodes.push({ id, type, name, filePath, signature: sig, docstring: '',
+                communityId: 0, checksum: '', isAutoGenerated: false,
+                startLine: lineNo, endLine: lineNo,
+                modifiers: [], className: null, packageName: pkgName });
+            edges.push({ sourceId: relPath, targetId: id, relationType: 'CONTAINS' });
+        };
+        const patterns = [
+            [/^(?:export\s+)?(?:async\s+)?function\s+(\w+)/gm, 'function'],
+            [/^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(/gm, 'function'],
+            [/^\s*def\s+(\w+)/gm, 'function'],
+            [/^\s*func\s+(\w+)/gm, 'function'],
+            [/^\s*fn\s+(\w+)/gm, 'function'],
+            [/^\s+(?:public|private|protected|static|final|\s)*\w[\w<>\[\]]*\s+(\w+)\s*\(/gm, 'method'],
+            [/^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/gm, 'class'],
+            [/^(?:public\s+)?(?:abstract\s+)?class\s+(\w+)/gm, 'class'],
+        ];
+        for (const [regex, type] of patterns) {
+            let m;
+            while ((m = regex.exec(code)) !== null) {
+                const name = m[1];
+                if (!name || name.length < 2)
+                    continue;
+                push(name, type, code.slice(0, m.index).split('\n').length - 1, m[0].trim());
+            }
         }
     }
 }
 exports.FileParser = FileParser;
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Name resolution helpers ───────────────────────────────────────────────────
+function resolveClassName(node, type) {
+    // Most languages: 'name' field or first identifier child
+    return (getFieldText(node, ['name', 'type_identifier', 'identifier']) ??
+        // Rust impl blocks: find the type being implemented
+        (type === 'impl_item' ? getFieldText(node, ['type']) : null));
+}
+function resolveMethodName(node, type) {
+    return getFieldText(node, ['name', 'identifier']);
+}
+function resolveFunctionName(node, type) {
+    // Arrow functions / function expressions assigned to variable:
+    // the variable name is in the parent, which we don't have here.
+    // We skip truly anonymous functions.
+    return getFieldText(node, ['name', 'identifier']);
+}
+function getFieldText(node, fields) {
+    for (const f of fields) {
+        const child = node.childForFieldName?.(f);
+        if (child?.text)
+            return child.text;
+    }
+    // Fallback scan of direct children
+    for (const child of (node.children ?? [])) {
+        if (child.type === 'identifier' || child.type === 'type_identifier') {
+            return child.text;
+        }
+    }
+    return null;
+}
+// ── Heritage (extends/implements) ────────────────────────────────────────────
+function extractHeritage(classNode, classId, relPath, edges) {
+    for (const child of (classNode.children ?? [])) {
+        const t = child.type;
+        if (['superclass', 'extends_clause', 'base_class_clause', 'class_heritage'].includes(t)) {
+            collectTypeNames(child).forEach(name => edges.push({ sourceId: classId, targetId: `${relPath}:${name}`, relationType: 'EXTENDS' }));
+        }
+        else if (['class_implements', 'implements_clause', 'super_interfaces'].includes(t)) {
+            collectTypeNames(child).forEach(name => edges.push({ sourceId: classId, targetId: `${relPath}:${name}`, relationType: 'IMPLEMENTS' }));
+        }
+    }
+}
+function collectTypeNames(node) {
+    const names = [];
+    const visit = (n) => {
+        if (n.type === 'type_identifier' || n.type === 'identifier')
+            names.push(n.text);
+        else
+            (n.children ?? []).forEach((c) => visit(c));
+    };
+    visit(node);
+    return names;
+}
+// ── Modifier extraction ───────────────────────────────────────────────────────
+function extractModifiers(node) {
+    const mods = new Set();
+    for (const child of (node.children ?? [])) {
+        if (MODIFIER_KEYWORDS.has(child.type) || MODIFIER_KEYWORDS.has(child.text ?? '')) {
+            mods.add(child.text ?? child.type);
+        }
+        if (child.type === 'modifiers') { // Java
+            for (const mod of (child.children ?? [])) {
+                if (MODIFIER_KEYWORDS.has(mod.text ?? ''))
+                    mods.add(mod.text);
+            }
+        }
+    }
+    return [...mods];
+}
+// ── Signature extraction ──────────────────────────────────────────────────────
+function extractSignature(node, code) {
+    const body = node.childForFieldName?.('body');
+    if (body)
+        return code.slice(node.startIndex, body.startIndex).replace(/\s+/g, ' ').trim().slice(0, 300);
+    return (node.text?.split('\n')[0] ?? '').trim().slice(0, 300);
+}
+function buildClassSignature(node, name) {
+    const first = node.text?.split('\n')[0] ?? `class ${name}`;
+    return first.trim().slice(0, 200);
+}
+// ── Docstring extraction ──────────────────────────────────────────────────────
 function extractDocstring(node, lines) {
     const startLine = node.startPosition?.row ?? 0;
     if (startLine === 0)
@@ -341,33 +509,40 @@ function extractDocstring(node, lines) {
     if (prevLine.startsWith('//') || prevLine.startsWith('#')) {
         return prevLine.replace(/^[/#\s*]+/, '').trim();
     }
-    if (prevLine.startsWith('*/')) {
+    if (prevLine === '*/') {
         const commentLines = [];
-        for (let i = startLine - 2; i >= 0; i--) {
+        for (let i = startLine - 2; i >= Math.max(0, startLine - 40); i--) {
             const l = lines[i].trim();
-            if (l.startsWith('/*') || l.startsWith('/**'))
+            if (l.startsWith('/**') || l.startsWith('/*'))
                 break;
             commentLines.unshift(l.replace(/^\*\s?/, ''));
         }
-        return commentLines.join(' ').trim();
+        return commentLines.join(' ').trim().slice(0, 500);
     }
+    // Python docstring
     const bodyNode = node.childForFieldName?.('body');
     if (bodyNode) {
         const first = bodyNode.children?.[0];
-        if (first?.type === 'expression_statement') {
-            const str = first.children?.[0];
-            if (str?.type === 'string') {
-                return str.text.replace(/^['"`]{1,3}|['"`]{1,3}$/g, '').trim();
-            }
+        const strNode = first?.type === 'expression_statement' ? first.children?.[0] : first;
+        if (strNode?.type === 'string') {
+            return strNode.text.replace(/^['"`]{1,3}|['"`]{1,3}$/g, '').trim().slice(0, 500);
         }
     }
     return '';
 }
-function extractSignature(node, code) {
-    const bodyNode = node.childForFieldName?.('body');
-    if (bodyNode) {
-        return code.slice(node.startIndex, bodyNode.startIndex).replace(/\s+/g, ' ').trim();
-    }
-    return node.text?.split('\n')[0]?.trim() ?? '';
+// ── Package name extraction ───────────────────────────────────────────────────
+function extractPackageName(code, langName) {
+    const matchers = {
+        java: /^\s*package\s+([\w.]+)\s*;/m,
+        go: /^\s*package\s+(\w+)/m,
+        rust: /^\s*(?:pub\s+)?mod\s+(\w+)/m,
+        typescript: /^\s*(?:export\s+)?(?:namespace|module)\s+(\w+)/m,
+    };
+    const m = code.match(matchers[langName] ?? /(?!)/);
+    return m?.[1] ?? null;
+}
+// ── Utilities ────────────────────────────────────────────────────────────────
+function hashText(text) {
+    return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 //# sourceMappingURL=FileParser.js.map
