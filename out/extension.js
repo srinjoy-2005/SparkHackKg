@@ -50,6 +50,7 @@ const CommunityDetector_1 = require("./core/analysis/CommunityDetector");
 const GraphUIServer_1 = require("./ui/GraphUIServer");
 const StatusBar_1 = require("./utils/StatusBar");
 const Logger_1 = require("./utils/Logger");
+const ContextInspectorPanel_1 = require("./ui/panels/ContextInspectorPanel");
 let graphStore = null;
 let mcpServer = null;
 let uiServer = null;
@@ -83,6 +84,13 @@ async function activate(context) {
     mcpServer = new MCPServer_1.MCPServer(graphStore, embeddingEngine, mcpPort);
     await mcpServer.start();
     Logger_1.Logger.info(`MCP server → http://localhost:${mcpPort}/mcp`);
+    // ── Context Inspector (Dev Mode) ──────────────────────────────────────────
+    const contextInspectorProvider = new ContextInspectorPanel_1.ContextInspectorPanel(context, graphStore);
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider('semanticKG.contextInspector', contextInspectorProvider));
+    // Pipe AI queries from the MCP Server directly into the UI Panel!
+    mcpServer.onQuery((event) => {
+        contextInspectorProvider.onMCPQuery(event);
+    });
     // ── Graph UI server ───────────────────────────────────────────────────────
     const uiPort = config.get('uiPort', 3580);
     uiServer = new GraphUIServer_1.GraphUIServer(graphStore, uiPort);

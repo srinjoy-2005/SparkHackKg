@@ -15,6 +15,24 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "semanticKGExplorer",
+          "title": "Knowledge Graph",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "semanticKGExplorer": [
+        {
+          "type": "webview",
+          "id": "semanticKG.contextInspector",
+          "name": "AI Context Inspector"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "semanticKG.rebuildGraph",

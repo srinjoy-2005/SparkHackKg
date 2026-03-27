@@ -14,6 +14,7 @@ import { CommunityDetector } from './core/analysis/CommunityDetector';
 import { GraphUIServer } from './ui/GraphUIServer';
 import { IndexingStatusBar } from './utils/StatusBar';
 import { Logger } from './utils/Logger';
+import { ContextInspectorPanel } from './ui/panels/ContextInspectorPanel';
 
 let graphStore: GraphStore | null = null;
 let mcpServer: MCPServer | null = null;
@@ -52,12 +53,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     embeddingEngine, graphStore, statusBar
   );
 
-  // ── MCP server ────────────────────────────────────────────────────────────
+// ── MCP server ────────────────────────────────────────────────────────────
   const config  = vscode.workspace.getConfiguration('semanticKG');
   const mcpPort: number = config.get('mcpPort', 3579);
   mcpServer = new MCPServer(graphStore, embeddingEngine, mcpPort);
   await mcpServer.start();
   Logger.info(`MCP server → http://localhost:${mcpPort}/mcp`);
+
+  // ── Context Inspector (Dev Mode) ──────────────────────────────────────────
+  const contextInspectorProvider = new ContextInspectorPanel(context, graphStore);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('semanticKG.contextInspector', contextInspectorProvider)
+  );
+
+  // Pipe AI queries from the MCP Server directly into the UI Panel!
+  mcpServer.onQuery((event) => {
+    contextInspectorProvider.onMCPQuery(event);
+  });
 
   // ── Graph UI server ───────────────────────────────────────────────────────
   const uiPort: number = config.get('uiPort', 3580);
