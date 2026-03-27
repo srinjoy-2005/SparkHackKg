@@ -120,19 +120,21 @@ class FileParser {
     async ensureInitialized() {
         if (this.initialized)
             return;
-        const ParserClass = require('web-tree-sitter');
-        // 0.22.x: init() is idempotent and safe to call every time,
-        // but it returns immediately after the first real load, so
-        // the typeof guard is kept for 0.20.x back-compat just in case.
-        if (typeof ParserClass.init === 'function') {
-            const wasmPath = path.join(this.extensionRoot, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
-            try {
-                await ParserClass.init({ locateFile: () => wasmPath });
-            }
-            catch (err) {
-                // "already initialized" is harmless in 0.22.x
-                if (!String(err).includes('already'))
-                    throw err;
+        Logger_1.Logger.info(`[DEBUG] ensureInitialized() started`);
+        const wasmPath = path.join(this.extensionRoot, 'node_modules', 'web-tree-sitter', 'tree-sitter.wasm');
+        Logger_1.Logger.info(`[DEBUG] Checking for main tree-sitter.wasm at: ${wasmPath}`);
+        if (!fs.existsSync(wasmPath)) {
+            throw new Error(`[DEBUG] Main WASM engine missing at ${wasmPath}`);
+        }
+        Logger_1.Logger.info(`[DEBUG] Requiring web-tree-sitter module...`);
+        const TreeSitter = require('web-tree-sitter');
+        try {
+            Logger_1.Logger.info(`[DEBUG] Awaiting TreeSitter.init()...`);
+            // Wrap init in a 5-second timeout to catch hangs
+            await withTimeout(TreeSitter.init({ locateFile: () => wasmPath }), 5000, "TreeSitter.init()");
+            Logger_1.Logger.info(`[DEBUG] TreeSitter.init() completed successfully.`);
+            if (!TreeSitter.Language) {
+                Logger_1.Logger.warn("[DEBUG] Tree-sitter init finished but Language class is missing on the object!");
             }
         }
         catch (e) {
