@@ -109,7 +109,7 @@
     "minimatch": "^9.0.4",
     "simple-git": "^3.22.0",
     "sql.js": "^1.11.0",
-    "web-tree-sitter": "^0.22.6"
+    "web-tree-sitter": "^0.20.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
